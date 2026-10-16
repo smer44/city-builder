@@ -60,13 +60,26 @@
         "*.asset": "yaml",
         "*.meta": "yaml",
         "*.prefab": "yaml",
-        "*.unity": "yaml",
+        "*.unity": "yaml"
     },
     "explorer.fileNesting.enabled": true,
     "explorer.fileNesting.patterns": {
         "*.sln": "*.csproj",
         "*.slnx": "*.csproj"
     },
-    "dotnet.defaultSolution": "My project.slnx",
-    "dotnet.enableWorkspaceBasedDevelopment": false
+    "dotnet.defaultSolution": "city_builder.slnx",
+    "dotnet.enableWorkspaceBasedDevelopment": false,
+    "workbench.colorCustomizations": {
+        "activityBar.background": "#9B4207",
+        "titleBar.activeBackground": "#D95D0A",
+        "titleBar.activeForeground": "#FFF8F4",
+        "titleBar.inactiveBackground": "#9B4207",
+        "titleBar.inactiveForeground": "#FFF8F4",
+        "statusBar.background": "#9B4207",
+        "statusBar.foreground": "#FFF8F4",
+        "statusBar.debuggingBackground": "#9B4207",
+        "statusBar.debuggingForeground": "#FFF8F4",
+        "statusBar.noFolderBackground": "#9B4207",
+        "statusBar.noFolderForeground": "#FFF8F4"
+    }
 }

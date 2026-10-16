@@ -49,7 +49,7 @@ public static class StorageFunctions
 
 
     /// <summary>
-    /// Adds the requested item amount into storage, can overflow.
+    /// Adds the requested item amount into storage if capacity allows.
     /// The method succeeds only if the storage has enough remaining capacity for the item's super type.
     /// </summary>
     /// <param name="capacities">List of storage capacities grouped by item super type.</param>
@@ -58,6 +58,9 @@ public static class StorageFunctions
     /// 
     public static bool Put(List<AmountOf<ItemSuperType>> capacities, List<AmountOf<ItemDefinition>> storedItems, AmountOf<ItemDefinition> request)
     {
+        if (!CanPut(capacities, storedItems, request))
+            return false;
+
         ItemDefinition item = request.Item;
         float amountToAdd = request.Amount;
 
