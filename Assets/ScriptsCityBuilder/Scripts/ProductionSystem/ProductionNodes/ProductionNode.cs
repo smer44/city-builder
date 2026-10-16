@@ -9,7 +9,9 @@ public enum ProductionSignal
     SkippedNotEnoughLabor,
     SkippedNotEnoughOutputSpace,
     RecipeOutputStoredOverCapacity,
-    Completed
+    Completed,
+    Interrupted
+
 }
 
 
@@ -56,6 +58,9 @@ public class ProductionNode : Storage
     [SerializeField] public float TotalLabor = 0f;
     [Header("Runtime")]
     [SerializeField] private float usedLabor = 0f;
+    private Dictionary<ItemSuperType, float> reservedSupertypeOutputs = new();
+    // Inputs committed to running executions; already consumed from storage at start.
+    private Dictionary<ItemType, float> reservedInputs = new();
 
     public float FreeLabor => TotalLabor - usedLabor;
 
@@ -98,6 +103,8 @@ public class ProductionNode : Storage
             else if (CanStartRecipe(recipe))
             {
                 queuedRecipes.RemoveAt(i);
+                ReserveOutputs(recipe);
+                ReserveInputs(recipe);
                 StartRecipe(recipe);
             }
             else
@@ -123,6 +130,7 @@ public class ProductionNode : Storage
 
     /// <summary>
     /// Advances all running recipe executions.
+    /// Interrupts executions that can no longer continue and returns their unused inputs.
     /// Any execution whose timer reaches 0 or below is completed:
     /// - outputs are stored
     /// - labor is released
@@ -133,12 +141,21 @@ public class ProductionNode : Storage
         for (int i = Work.Count - 1; i >= 0; i--)
         {
             RecipeExecution execution = Work[i];
+
+            if (!CanContinueRecipe(execution))
+            {
+                EndRecipeInterrupted(execution);
+                Work.RemoveAt(i);
+                SendSignal(execution.Recipe, ProductionSignal.Interrupted);
+                continue;
+            }
+
             execution.Timer -= deltaTime;
 
             if (execution.Timer > 0f)
                 continue;
 
-            CompleteExecution(execution);
+            EndRecipeGood(execution);
             Work.RemoveAt(i);
             SendSignal(execution.Recipe, ProductionSignal.Completed);
         }
@@ -147,14 +164,56 @@ public class ProductionNode : Storage
             StartQueuedRecipes();
     }
 
+    protected virtual bool CanContinueRecipe(RecipeExecution execution)
+    {
+        return true;
+    }
 
-    private void CompleteExecution(RecipeExecution execution)
+    /// <summary>
+    /// Returns the unused inputs, assuming consumption is proportional to elapsed execution time.
+    /// </summary>
+    private List<AmountOf<ItemDefinition>> GetRemainingGoods(RecipeExecution execution)
     {
         Recipe recipe = execution.Recipe;
+        float remainingFraction = recipe.Time > 0f ? Mathf.Clamp01(execution.Timer / recipe.Time) : 0f;
+        List<AmountOf<ItemDefinition>> remainingGoods = new();
 
+        for (int i = 0; i < recipe.Inputs.Count; i++)
+        {
+            AmountOf<ItemDefinition> remaining = recipe.Inputs[i].CreateRuntimeAmount();
+            remaining.Amount *= remainingFraction;
+            if (remaining.Amount > 0f)
+                remainingGoods.Add(remaining);
+        }
+
+        return remainingGoods;
+    }
+
+    private void EndRecipeInterrupted(RecipeExecution execution)
+    {
+        Recipe recipe = execution.Recipe;
+        List<AmountOf<ItemDefinition>> remainingGoods = GetRemainingGoods(execution);
+
+        for (int i = 0; i < remainingGoods.Count; i++)
+        {
+            AmountOf<ItemDefinition> remaining = remainingGoods[i];
+            if (!StorageFunctions.Put(this, remaining))
+                Debug.LogWarning($"Could not restore {remaining.Amount} of input '{remaining.Item.name}' after interrupting recipe '{recipe.DisplayName}': insufficient storage capacity.");
+        }
+
+        FreeReservedOutputs(recipe);
+        usedLabor -= recipe.Labor;
+    }
+
+
+    private void EndRecipeGood(RecipeExecution execution)
+    {
+        Recipe recipe = execution.Recipe;
+        FreeReservedOutputs(recipe);
         PutOutputs(recipe);
         usedLabor -= recipe.Labor;
 
+        //wrong
         if (usedLabor < 0f)
             usedLabor = 0f;
 
@@ -165,6 +224,7 @@ public class ProductionNode : Storage
     /// - checks labor
     /// - checks inputs
     /// - checks planned output space
+    /// - reserves output space and inputs
     /// - consumes inputs
     /// - reserves labor
     /// - adds execution to Work
@@ -175,8 +235,27 @@ public class ProductionNode : Storage
         if (!CanStartRecipe(recipe))
             return false;
 
+        ReserveOutputs(recipe);
+        //ReserveInputs(recipe);
         StartRecipe(recipe);
         return true;
+    }
+
+    private void ReserveOutputs(Recipe recipe)
+    {
+        Dictionary<ItemSuperType, float> outputBySuperType = StorageFunctions.GetOutputBySuperType(recipe.Outputs);
+        StorageFunctions.AddDictionaryValues(reservedSupertypeOutputs, outputBySuperType);
+    }
+
+    private void FreeReservedOutputs(Recipe recipe)
+    {
+        Dictionary<ItemSuperType, float> outputBySuperType = StorageFunctions.GetOutputBySuperType(recipe.Outputs);
+        StorageFunctions.SubstractDictionaryValues(reservedSupertypeOutputs, outputBySuperType);
+    }
+
+    private void ReserveInputs(Recipe recipe)
+    {
+        reservedInputs = StorageFunctions.GetInputByType(recipe.Inputs, reservedInputs);
     }
 
     private void StartRecipe(Recipe recipe)
@@ -189,6 +268,11 @@ public class ProductionNode : Storage
 
     public bool CanStartRecipe(Recipe recipe)
     {
+        foreach (ItemAmount input in recipe.Inputs)
+            RegisterItemDefinition(input.Item);
+        foreach (ItemAmount output in recipe.Outputs)
+            RegisterItemDefinition(output.Item);
+
         if (!HasEnoughLabor(recipe))
         {
             SendSignal(recipe, ProductionSignal.SkippedNotEnoughLabor);
@@ -232,21 +316,12 @@ public class ProductionNode : Storage
 
     private bool HasEnoughInputs(Recipe recipe)
     {
-        Dictionary<ItemDefinition, float> needed = new();
+        // Running executions' inputs have already been removed from StoredItems.
+        Dictionary<ItemType, float> inputsDict = StorageFunctions.ListToDict(recipe.Inputs);
 
-        for (int i = 0; i < recipe.Inputs.Count; i++)
-        {
-            ItemAmount input = recipe.Inputs[i];
-
-            if (needed.ContainsKey(input.Item))
-                needed[input.Item] += input.Amount;
-            else
-                needed.Add(input.Item, input.Amount);
-        }
-
-        foreach (var pair in needed)
+        foreach (var pair in inputsDict)
         { 
-            float stored =   StorageFunctions.GetStoredAmountByType(StoredItems, pair.Key.ItemType);
+            StoredItems.TryGetValue(pair.Key, out float stored);
             if (stored < pair.Value)
                 return false;
         }
@@ -256,26 +331,14 @@ public class ProductionNode : Storage
 
     private bool HasEnoughOutputSpace(Recipe recipe)
     {
-        Dictionary<ItemSuperType, float> producedBySuperType = new();
+        Dictionary<ItemSuperType, float> outputBySuperType = StorageFunctions.GetOutputBySuperType(recipe.Outputs);
 
-        for (int i = 0; i < recipe.Outputs.Count; i++)
+        foreach (var pair in outputBySuperType)
         {
-            ItemAmount output = recipe.Outputs[i];
-            ItemSuperType superType = output.Item.ItemSuperType;
-
-            if (producedBySuperType.ContainsKey(superType))
-                producedBySuperType[superType] += output.Amount;
-            else
-                producedBySuperType.Add(superType, output.Amount);
-        }
-
-        foreach (var pair in producedBySuperType)
-        {
-            if (StorageSize == null)
-                return false;
-            float capacity = StorageFunctions.GetCapacity(StorageSize.Capacities, pair.Key);
-            float stored = StorageFunctions.GetStoredAmountBySuperType(StoredItems, pair.Key);
-            float free = capacity - stored;
+            float capacity = StorageFunctions.GetCapacity(StorageCapacities, pair.Key);
+            float stored = StorageFunctions.GetStoredAmountBySuperType(this, pair.Key);
+            reservedSupertypeOutputs.TryGetValue(pair.Key, out float reserved);
+            float free = capacity - stored - reserved;
 
             if (free < pair.Value)
                 return false;
@@ -298,10 +361,7 @@ public class ProductionNode : Storage
         {
             ItemAmount output = recipe.Outputs[i];
 
-            bool stored = StorageFunctions.Put(StorageSize.Capacities, StoredItems, output.CreateRuntimeAmount());
-
-            // Your current Put() already stores the output first and returns false afterward
-            // when capacity is exceeded. So on false we only signal; we do not add again.
+            bool stored = StorageFunctions.Put(this, output.CreateRuntimeAmount());
             if (!stored)
             {
                 SendSignal(recipe, ProductionSignal.RecipeOutputStoredOverCapacity);
@@ -312,18 +372,15 @@ public class ProductionNode : Storage
 
     private void GetInputs(Recipe recipe)
     {
-        for (int i = 0; i < recipe.Inputs.Count; i++)
-        {   
-            var input = recipe.Inputs[i].CreateRuntimeAmount();
-            bool ok = StorageFunctions.CanGet(StoredItems, input);           
-
-            if (!ok)
-                throw new InvalidOperationException($"Failed to consume input '{recipe.Inputs[i].Item.name}' for recipe '{recipe.DisplayName}'.");
-            else
-            {
-                 StorageFunctions.Get(StoredItems, input);
-            }
+        Dictionary<ItemType, float> inputsDict = StorageFunctions.ListToDict(recipe.Inputs);
+        foreach (var pair in inputsDict)
+        {
+            StoredItems.TryGetValue(pair.Key, out float stored);
+            if (stored < pair.Value)
+                throw new InvalidOperationException($"Failed to consume input type '{pair.Key}' for recipe '{recipe.DisplayName}'.");
         }
+
+        StorageFunctions.SubstractDictionaryValues(StoredItems, inputsDict);
     }
 
 }
